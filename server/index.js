@@ -6,17 +6,6 @@ import express from "express";
 import cors from "cors";
 import { buildEscalationLine } from "./escalations.js";
 
-// Optionaler Fetch-Fallback (nur falls global fetch nicht vorhanden ist)
-let _fetch = globalThis.fetch;
-if (!_fetch) {
-  // Nur nötig, wenn du node-fetch installierst:
-  // npm i node-fetch
-  // und dann:
-  // const mod = await import("node-fetch");
-  // _fetch = mod.default;
-  console.warn("[server] global fetch not found. If requests fail, install node-fetch.");
-}
-
 const app = express();
 
 // ✅ wichtig für Expo Go / iPhone
@@ -24,7 +13,12 @@ app.use(cors());
 app.use(express.json({ limit: "2mb" }));
 
 const PORT = process.env.PORT ? Number(process.env.PORT) : 8787;
-const HOST = "0.0.0.0"; // ✅ damit Geräte im WLAN zugreifen können / Render bind
+const HOST = "0.0.0.0";
+
+// --- Root (damit die Render-URL ohne /health nicht "Error" zeigt) ---
+app.get("/", (_req, res) => {
+  res.redirect("/health");
+});
 
 // --- Health ---
 app.get("/health", (_req, res) => {
@@ -33,6 +27,7 @@ app.get("/health", (_req, res) => {
     service: "vivamed-server",
     port: PORT,
     time: new Date().toISOString(),
+    env: process.env.RENDER ? "render" : "local",
   });
 });
 
@@ -166,7 +161,7 @@ function miniFeedbackStyleForDifficulty(difficulty) {
   return { enabled: false, style: "kein Feedback" };
 }
 
-// kleine Helper: OpenAI output_text extrahieren
+// Helper: OpenAI output_text extrahieren
 function extractOutputText(data) {
   return (
     data?.output?.[0]?.content?.find?.((c) => c?.type === "output_text")?.text ??
@@ -174,6 +169,9 @@ function extractOutputText(data) {
     ""
   );
 }
+
+// ---- fetch (Node 20+ hat global fetch) ----
+const _fetch = globalThis.fetch;
 
 // --- Examiner turn ---
 app.post("/api/examiner-turn", async (req, res) => {
@@ -196,7 +194,6 @@ app.post("/api/examiner-turn", async (req, res) => {
 
     const persona = pickExaminerPersona({ tone, difficulty, examinerProfile });
 
-    // Messages für Phase/Eskalation im assistant/user-format
     const asOpenAiLike = messages.map((m) => ({
       role: m.role === "examiner" ? "assistant" : "user",
       content: String(m.text ?? ""),
@@ -310,6 +307,10 @@ Wichtig: nicht spoilern, keine langen Erklärungen.`
       return res.status(500).json({ error: "Missing OPENAI_API_KEY env var" });
     }
 
+    if (!_fetch) {
+      return res.status(500).json({ error: "Missing global fetch in this Node runtime" });
+    }
+
     const reqId = Math.random().toString(16).slice(2);
     const t0 = Date.now();
 
@@ -342,7 +343,9 @@ Wichtig: nicht spoilern, keine langen Erklärungen.`
     const text = extractOutputText(data);
     const dt = Date.now() - t0;
 
-    console.log(`[examiner-turn][${reqId}] ok in ${dt}ms (difficulty=${difficulty}, persona=${persona}, phase=${phase})`);
+    console.log(
+      `[examiner-turn][${reqId}] ok in ${dt}ms (difficulty=${difficulty}, persona=${persona}, phase=${phase})`
+    );
 
     return res.json({ text: String(text).trim() });
   } catch (e) {
@@ -373,6 +376,10 @@ app.post("/api/feedback-report", async (req, res) => {
     const apiKey = process.env.OPENAI_API_KEY;
     if (!apiKey) {
       return res.status(500).json({ error: "Missing OPENAI_API_KEY env var" });
+    }
+
+    if (!_fetch) {
+      return res.status(500).json({ error: "Missing global fetch in this Node runtime" });
     }
 
     const convo = messages
@@ -439,9 +446,7 @@ Schema exakt (valide JSON):
     "management": "1-2 Sätze",
     "closing": "1-2 Sätze"
   },
-  "drills": [
-    { "title": "...", "why": "...", "how": "..." }
-  ]
+  "drills": [{ "title": "...", "why": "...", "how": "..." }]
 }
 `.trim();
 
@@ -486,10 +491,7 @@ ${checklist ? JSON.stringify(checklist).slice(0, 6000) : "—"}
     const parsed = extractJsonObject(text);
     if (!parsed) {
       console.error(`[feedback-report][${reqId}] AI returned non-JSON:`, String(text).slice(0, 500));
-      return res.status(500).json({
-        error: "AI returned non-JSON",
-        detail: String(text).slice(0, 2000),
-      });
+      return res.status(500).json({ error: "AI returned non-JSON", detail: String(text).slice(0, 2000) });
     }
 
     return res.json({ report: parsed });
@@ -502,5 +504,5 @@ ${checklist ? JSON.stringify(checklist).slice(0, 6000) : "—"}
 // ✅ Listen on 0.0.0.0 (Render + LAN)
 app.listen(PORT, HOST, () => {
   console.log(`VivaMed server running on http://${HOST}:${PORT}`);
-  console.log(`Health check local:  http://localhost:${PORT}/health`);
+  console.log(`Health check: http://localhost:${PORT}/health`);
 });
