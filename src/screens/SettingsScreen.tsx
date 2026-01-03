@@ -15,18 +15,17 @@ import { loadAppSettings, saveAppSettings, pingServerHealth } from "../logic/app
 /**
  * ✅ V1 Pro-Codes (offline)
  */
-const VALID_PRO_CODES = [
-  "VM-DEMO-2026",
-  "VM-9K2F-R7Q1",
-  "VM-4T8A-H2WZ",
-];
+const VALID_PRO_CODES = ["VM-DEMO-2026", "VM-9K2F-R7Q1", "VM-4T8A-H2WZ"];
 
+// ✅ Production default (Render) – kommt aus .env
+const DEFAULT_API_URL = (process.env.EXPO_PUBLIC_API_URL ?? "https://vivamed.onrender.com").replace(/\/+$/, "");
+
+/** Normalize a base URL string to "http(s)://host:port" without trailing slash */
 function normalizeBaseUrl(input: any): string {
   let s = String(input ?? "").trim();
   if (!s) return "";
   if (!/^https?:\/\//i.test(s)) s = `http://${s}`;
   s = s.replace(/\/+$/, "");
-  // block obvious placeholder:
   if (s.includes("DEINE_MAC_IP")) return "";
   return s;
 }
@@ -41,7 +40,10 @@ function rgba(hex: string, alpha: number) {
 }
 
 function normalizeCode(input: string) {
-  return String(input ?? "").trim().replace(/\s+/g, "").toUpperCase();
+  return String(input ?? "")
+    .trim()
+    .replace(/\s+/g, "")
+    .toUpperCase();
 }
 
 function isValidProCode(code: string) {
@@ -77,23 +79,33 @@ export function SettingsScreen({ navigation }: any) {
   const [codeInput, setCodeInput] = useState("");
 
   const normalizedInput = useMemo(() => normalizeBaseUrl(baseUrlInput), [baseUrlInput]);
+
   const isDirty = useMemo(
     () => normalizeBaseUrl(baseUrlInput) !== normalizeBaseUrl(savedBaseUrl),
     [baseUrlInput, savedBaseUrl]
   );
 
+  const effectiveUrl = useMemo(() => {
+    // UI status should show what will be used: saved → input → default
+    return normalizeBaseUrl(savedBaseUrl) || normalizeBaseUrl(baseUrlInput) || DEFAULT_API_URL;
+  }, [savedBaseUrl, baseUrlInput]);
+
   const chipText = useMemo(() => {
-    const url = normalizeBaseUrl(savedBaseUrl || baseUrlInput);
+    const url = effectiveUrl;
     if (!url) return "Server: keine URL gesetzt";
     if (health === null) return `Server: ? (${url})`;
     return health ? `Server: OK (${url})` : `Server: Fehler (${url})`;
-  }, [savedBaseUrl, baseUrlInput, health]);
+  }, [effectiveUrl, health]);
 
   const refresh = async () => {
     const s = await loadAppSettings();
-    const url = normalizeBaseUrl((s as any)?.aiBaseUrl);
-    setSavedBaseUrl(url);
-    setBaseUrlInput(url);
+    const urlFromSettings = normalizeBaseUrl((s as any)?.aiBaseUrl);
+
+    // ✅ Wenn noch nie etwas gespeichert wurde: Default (Render) nehmen
+    const url = urlFromSettings || DEFAULT_API_URL;
+
+    setSavedBaseUrl(urlFromSettings); // saved = nur das, was wirklich gespeichert ist
+    setBaseUrlInput(url); // input = das, was wir anzeigen/bearbeiten
     setHealth(null);
     setHealthDetails(null);
 
@@ -112,14 +124,14 @@ export function SettingsScreen({ navigation }: any) {
     const url = normalizeBaseUrl(baseUrlInput);
 
     if (!url) {
-      Alert.alert("Fehlt noch", "Bitte eine Server-URL eintragen, z.B. http://192.168.x.x:8787");
+      Alert.alert("Fehlt noch", `Bitte eine Server-URL eintragen.\n\nBeispiel: ${DEFAULT_API_URL}`);
       return;
     }
 
     if (url.includes("localhost")) {
       Alert.alert(
         "Hinweis",
-        "localhost funktioniert nur auf dem Simulator/Mac. Auf dem iPhone bitte die IP deines Rechners nutzen (z.B. 192.168.x.x)."
+        "localhost funktioniert nur auf dem Simulator/Mac. Auf dem iPhone bitte eine echte IP oder eine Online-URL nutzen."
       );
     }
 
@@ -138,10 +150,16 @@ export function SettingsScreen({ navigation }: any) {
     }
   };
 
-  const onTest = async (mode: "input" | "saved") => {
+  const onTest = async (mode: "input" | "saved" | "effective") => {
     Keyboard.dismiss();
 
-    const url = mode === "saved" ? normalizeBaseUrl(savedBaseUrl) : normalizeBaseUrl(baseUrlInput);
+    const url =
+      mode === "saved"
+        ? normalizeBaseUrl(savedBaseUrl)
+        : mode === "input"
+        ? normalizeBaseUrl(baseUrlInput)
+        : effectiveUrl;
+
     if (!url) {
       setHealth(false);
       setHealthDetails(null);
@@ -154,11 +172,9 @@ export function SettingsScreen({ navigation }: any) {
     setHealthDetails(null);
 
     try {
-      // 1) quick boolean
       const ok = await pingServerHealth(url);
       setHealth(ok);
 
-      // 2) details for UI
       const details = await fetchHealthDetails(url);
       if (details.ok) setHealthDetails({ service: details.service, time: details.time });
 
@@ -166,7 +182,7 @@ export function SettingsScreen({ navigation }: any) {
         ok ? "Verbindung OK ✅" : "Keine Verbindung ❌",
         ok
           ? `Der Server antwortet auf /health.${details?.service ? `\nService: ${details.service}` : ""}`
-          : "Prüfe: IP, WLAN, Firewall, Server läuft? (Am Handy im Browser: http://IP:8787/health)"
+          : `Prüfe URL/Internet.\nTipp: Öffne am Handy im Browser:\n${url}/health`
       );
     } finally {
       setBusy(false);
@@ -174,19 +190,27 @@ export function SettingsScreen({ navigation }: any) {
   };
 
   const onFillExample = () => {
-    setBaseUrlInput("http://192.168.178.25:8787");
+    setBaseUrlInput("http://192.168.178.25:8788");
     setHealth(null);
     setHealthDetails(null);
   };
 
   const onFillLocalhost = () => {
-    setBaseUrlInput("http://localhost:8787");
+    // ✅ wirklich localhost – nur für Simulator/Mac (du nutzt lokal 8788)
+    setBaseUrlInput("http://localhost:8788");
+    setHealth(null);
+    setHealthDetails(null);
+  };
+
+  const onFillDefault = () => {
+    setBaseUrlInput(DEFAULT_API_URL);
     setHealth(null);
     setHealthDetails(null);
   };
 
   const onResetToSaved = () => {
-    setBaseUrlInput(savedBaseUrl);
+    // wenn kein saved vorhanden: zurück zu Default
+    setBaseUrlInput(normalizeBaseUrl(savedBaseUrl) || DEFAULT_API_URL);
     setHealth(null);
     setHealthDetails(null);
   };
@@ -234,7 +258,11 @@ export function SettingsScreen({ navigation }: any) {
 
   return (
     <ThemedScreen section="home" style={{ paddingHorizontal: 0, paddingTop: 0 }}>
-      <ScrollView contentContainerStyle={styles.scroll} showsVerticalScrollIndicator={false} keyboardShouldPersistTaps="handled">
+      <ScrollView
+        contentContainerStyle={styles.scroll}
+        showsVerticalScrollIndicator={false}
+        keyboardShouldPersistTaps="handled"
+      >
         {/* Header */}
         <View style={styles.header}>
           <View style={{ flex: 1 }}>
@@ -256,7 +284,9 @@ export function SettingsScreen({ navigation }: any) {
 
             {!isPro ? (
               <>
-                <Text style={[styles.smallHint, { marginTop: 10 }]}>Du hast einen Pro-Code? Gib ihn hier ein. (Ohne Leerzeichen)</Text>
+                <Text style={[styles.smallHint, { marginTop: 10 }]}>
+                  Du hast einen Pro-Code? Gib ihn hier ein. (Ohne Leerzeichen)
+                </Text>
 
                 <TextInput
                   value={codeInput}
@@ -275,7 +305,9 @@ export function SettingsScreen({ navigation }: any) {
                 </View>
               </>
             ) : (
-              <Text style={[styles.smallHint, { marginTop: 10 }]}>Pro ist aktiv. Simulationen und Drills sind unbegrenzt verfügbar.</Text>
+              <Text style={[styles.smallHint, { marginTop: 10 }]}>
+                Pro ist aktiv. Simulationen und Drills sind unbegrenzt verfügbar.
+              </Text>
             )}
 
             <View style={{ marginTop: 10 }}>
@@ -307,11 +339,11 @@ export function SettingsScreen({ navigation }: any) {
 
             <View style={{ marginTop: 10, flexDirection: "row", gap: 10, flexWrap: "wrap" }}>
               {isDirty ? <Chip text="Nicht gespeichert" tone="soft" /> : <Chip text="Gespeichert" selected tone="soft" />}
-              {savedBaseUrl ? <Chip text="Quelle: AppSettings" tone="soft" /> : <Chip text="Quelle: —" tone="soft" />}
+              {savedBaseUrl ? <Chip text="Quelle: AppSettings" tone="soft" /> : <Chip text="Quelle: Default (ENV)" tone="soft" />}
             </View>
 
             <Text style={styles.smallHint}>
-              Expo Go am iPhone: nutze deine Mac-IP (nicht localhost). Beispiel: http://192.168.x.x:8787
+              Für echte Nutzer:innen: nutze immer die Online-URL (Render). Lokal brauchst du IP/localhost nur zum Testen.
             </Text>
           </Card>
         </View>
@@ -331,7 +363,7 @@ export function SettingsScreen({ navigation }: any) {
               }}
               autoCapitalize="none"
               autoCorrect={false}
-              placeholder="http://192.168.0.10:8787"
+              placeholder={DEFAULT_API_URL}
               placeholderTextColor={colors.textMuted}
               style={[styles.input, { borderColor: tintBorder, backgroundColor: tintBg }]}
               returnKeyType="done"
@@ -345,6 +377,13 @@ export function SettingsScreen({ navigation }: any) {
 
             <View style={{ marginTop: 10, gap: 10 }}>
               <VButton title={busy ? "Bitte warten…" : "Speichern"} variant="cta" onPress={onSave} disabled={busy} />
+
+              <VButton
+                title={busy ? "Bitte warten…" : "Verbindung testen (effektiv) → /health"}
+                variant="outline"
+                onPress={() => onTest("effective")}
+                disabled={busy}
+              />
 
               <VButton
                 title={busy ? "Bitte warten…" : "Verbindung testen (Eingabe) → /health"}
@@ -362,12 +401,14 @@ export function SettingsScreen({ navigation }: any) {
 
               {isDirty ? <VButton title="Änderungen verwerfen" variant="ghost" onPress={onResetToSaved} /> : null}
 
-              <VButton title="Beispiel-IP einfügen" variant="ghost" onPress={onFillExample} />
+              <VButton title="Default (Render) einfügen" variant="ghost" onPress={onFillDefault} />
+              <VButton title="Beispiel-IP einfügen (LAN Test)" variant="ghost" onPress={onFillExample} />
               <VButton title="localhost einfügen (nur Simulator/Mac)" variant="ghost" onPress={onFillLocalhost} />
             </View>
 
             <Text style={styles.smallHint}>
-              Tipp: Wenn dein iPhone den Server nicht erreicht, liegt es fast immer an: WLAN unterschiedlich, Firewall, falsche IP oder Server läuft nicht.
+              Tipp: Wenn dein iPhone lokal nicht rankommt, liegt es fast immer an: WLAN unterschiedlich, Firewall, falsche IP oder Server läuft nicht.
+              Für echte Nutzer:innen nimm immer die Online-URL (Render).
             </Text>
           </Card>
         </View>
