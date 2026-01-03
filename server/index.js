@@ -170,6 +170,12 @@ function extractOutputText(data) {
   );
 }
 
+// ✅ neu: letzte Nutzerantwort
+function lastUserAnswer(openAiLikeMessages) {
+  const last = [...openAiLikeMessages].reverse().find((m) => m.role === "user");
+  return String(last?.content ?? "").trim();
+}
+
 // ---- fetch (Node 20+ hat global fetch) ----
 const _fetch = globalThis.fetch;
 
@@ -186,6 +192,17 @@ app.post("/api/examiner-turn", async (req, res) => {
     const tone = String(cfg?.tone ?? "neutral");
     const difficulty = clamp(Number(cfg?.difficulty ?? 65), 0, 100);
     const examinerProfile = String(cfg?.examinerProfile ?? "standard");
+
+    // ✅ NEU: KI-Modus (Training vs Prüfung)
+    // Erwartete Werte: "training" | "exam"
+    // Fallback: bei niedriger Schwierigkeit eher training, sonst exam
+    const aiModeRaw = String(cfg?.aiMode ?? "").trim().toLowerCase();
+    const aiMode =
+      aiModeRaw === "training" || aiModeRaw === "exam"
+        ? aiModeRaw
+        : difficulty < 70
+        ? "training"
+        : "exam";
 
     const caseTitle = String(generatedCase?.title ?? "");
     const vignette = String(generatedCase?.vignette ?? "");
@@ -248,12 +265,29 @@ app.post("/api/examiner-turn", async (req, res) => {
         ? "Mittel: strukturiert, kleine Hinweise möglich, aber nicht spoilern."
         : "Einsteigerfreundlich: stark strukturierend, kleine Hilfen erlaubt.";
 
-    const systemInstructions = `
-Du bist ein medizinischer Prüfer für Studierende (OSCE/M3-tauglich).
-Du führst ein Prüfungsgespräch als Dialog und reagierst auf die letzte Antwort.
+    const userLast = lastUserAnswer(asOpenAiLike);
 
-Ziel: maximale Lernwirksamkeit + realistische Prüfungssituation.
-Du bleibst IMMER im Fallkontext und im Fachgebiet.
+    // ✅ NEU: Modus-Definitionen
+    const modeLine =
+      aiMode === "exam"
+        ? `
+Modus: PRÜFUNGSSIMULATION.
+- Du bist knapp, fordernd, M3-nah.
+- Du hilfst kaum. Wenn etwas unscharf ist: du fragst nach, statt zu erklären.
+- Du darfst bei difficulty>=70 auch unterbrechen, um Präzision/Prioritäten einzufordern.
+`.trim()
+        : `
+Modus: TRAINING.
+- Du bist menschlich, zugewandt, aber prüfungsnah.
+- Wenn etwas unscharf ist: du fragst 1x nach UND darfst max. 1 Mini-Hinweis geben.
+- Du erklärst NICHT lang, sondern führst mit gezielten Nachfragen.
+`.trim();
+
+    const systemInstructions = `
+Du bist ein echter medizinischer Prüfer (M3/OSCE), deutsch, realistisch, menschlich.
+Du führst ein Prüfungsgespräch als Dialog. Du reagierst PRÄZISE auf die letzte Antwort des Kandidaten.
+
+${modeLine}
 
 Rahmen:
 - Fach: ${fachrichtung}
@@ -262,23 +296,49 @@ Rahmen:
 - Schwierigkeit: ${difficulty} (0..100) → ${difficultyStyle}
 - Prüferprofil: ${examinerProfile}
 - Prüferverhalten (dynamisch): ${personaStyle}
-
-Phasensteuerung:
 - Aktuelle Phase (intern): ${phase}
-- Du steuerst grob: intro → ddx → diagnostics → management → closing
-- Wenn Kandidat gut ist: geh tiefer (Begründung, Priorisierung, nächste Konsequenz).
-- Wenn Kandidat unsicher ist: eng führen (max 1 Hinweis), dann erneut prüfen.
+
+Wichtig: Gesprächsqualität
+1) Bezug:
+- Beziehe dich IMMER auf 1–2 konkrete Elemente aus der letzten Antwort.
+- Zitiere kurz 1–6 Wörter in Anführungszeichen, z.B. "Troponin" oder "NIV".
+- Wenn die Antwort sehr allgemein ist: sag das knapp ("Das ist mir zu unkonkret.").
+
+2) Wenn unklar/unscharf:
+- Stelle eine KLÄRUNGSFRAGE statt Themawechsel.
+- Beispiele: "Was meinen Sie genau mit …?" / "Welche 2 Ursachen priorisieren Sie – und warum?"
+
+3) Prüferlogik (prüfungsnah):
+- Wenn gut: geh 1 Stufe tiefer (Begründung, Priorisierung, Konsequenz).
+- Wenn lückenhaft: fokussiere auf die größte Lücke (Red Flags / nächster Schritt).
+- Wenn Kandidat festhängt:
+  - Im TRAINING-Modus: max. 1 Mini-Hinweis.
+  - Im PRÜFUNG-Modus: KEIN Hinweis, nur Nachfragen.
+
+4) Unterbrechen/Pushen (nur bei difficulty >= 70):
+- Wenn Antwort lang aber unspezifisch ist: beginne mit "Unterbrechung:" + 1 Satz Korrektur + dann 1 präzise Frage.
+- Wenn Kandidat abdriftet: lenke zurück auf Prioritäten.
 
 Fallverschärfung:
 - Für diesen Turn: escalate=${escalate ? "true" : "false"}.
 - Wenn escalate=true: Nutze GENAU die vorgegebene Verschärfungs-Zeile (kein Erfinden zusätzlicher Befunde).
-- Ausgabe: erste Zeile "Verschärfung: <...>", danach genau 1 Frage.
 
 Ausgabeformat (sehr wichtig):
-- PRO TURN genau 1 Frage (max 2 Sätze).
-- Wenn miniFeedbackEnabled=true: genau EINE zusätzliche Zeile am Ende beginnend mit "Feedback:" (max 1 Satz).
-- Keine Tabellen, keine langen Monologe.
+- Schreibe wie ein Mensch (kurze Sätze, natürliche Sprache, keine Textwand).
+- Maximal 4 kurze Zeilen insgesamt.
+- Struktur:
+  Zeile 1: optional "Verschärfung: ..." ODER optional "Unterbrechung: ..."
+  Zeile 2: 1 sehr kurzer Bezug auf die letzte Antwort (z.B. "Sie sagen '...'.")
+  Zeile 3: GENAU 1 Frage (max. 1–2 Sätze)
+  Zeile 4: optional "Feedback: ..." nur wenn miniFeedbackEnabled=true
+
+- PRO TURN genau 1 Frage.
+- Keine Tabellen, keine Bullet-Listen.
+- Keine Meta-Erklärungen ("Ich bin ein Prüfer...").
 - Antworte als reiner Text.
+
+Letzte Kandidatenantwort (nur zur Orientierung, nicht wiederholen, nur kurz referenzieren):
+"${userLast}"
 `.trim();
 
     const caseContext = `
@@ -344,10 +404,10 @@ Wichtig: nicht spoilern, keine langen Erklärungen.`
     const dt = Date.now() - t0;
 
     console.log(
-      `[examiner-turn][${reqId}] ok in ${dt}ms (difficulty=${difficulty}, persona=${persona}, phase=${phase})`
+      `[examiner-turn][${reqId}] ok in ${dt}ms (mode=${aiMode}, difficulty=${difficulty}, persona=${persona}, phase=${phase})`
     );
 
-    return res.json({ text: String(text).trim() });
+    return res.json({ text: String(text).trim(), meta: { mode: aiMode, phase, persona } });
   } catch (e) {
     console.error("[examiner-turn] Server crashed:", e);
     return res.status(500).json({ error: "Server crashed", detail: String(e?.message ?? e) });
