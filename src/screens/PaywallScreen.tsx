@@ -1,3 +1,4 @@
+// src/screens/PaywallScreen.tsx
 import React, { useMemo, useState } from "react";
 import { View, Text, StyleSheet, TextInput, Alert, ScrollView, Keyboard } from "react-native";
 
@@ -43,6 +44,7 @@ export function PaywallScreen({ navigation, route }: any) {
   const { tokens } = useSectionTheme();
 
   const reason = String(route?.params?.reason ?? "").trim(); // optional: "Simulationen" / "Drills" / ...
+  const returnTo = String(route?.params?.returnTo ?? "").trim(); // optional: screen name
 
   const [codeInput, setCodeInput] = useState("");
   const [busy, setBusy] = useState(false);
@@ -54,11 +56,7 @@ export function PaywallScreen({ navigation, route }: any) {
   const [demoUsed, setDemoUsed] = useState(0);
   const [demoLeft, setDemoLeft] = useState(5);
 
-  // Preis-Text kann später zentralisiert werden
-  const priceText = useMemo(() => {
-    // später z.B.: "7,99€/Monat"
-    return "Preis folgt (Beta)";
-  }, []);
+  const priceText = useMemo(() => "Preis folgt (Beta)", []);
 
   React.useEffect(() => {
     let cancelled = false;
@@ -67,16 +65,13 @@ export function PaywallScreen({ navigation, route }: any) {
       try {
         const s = await loadAppSettings();
         const meta = await getDemoSimulationMeta();
-
         if (cancelled) return;
 
         setIsPro(!!(s as any)?.isPro);
-
         setDemoLimit(meta.limit);
         setDemoUsed(meta.used);
         setDemoLeft(meta.left);
       } catch {
-        // fallback (niemals crashen)
         if (cancelled) return;
         setDemoLimit(5);
         setDemoUsed(0);
@@ -90,9 +85,18 @@ export function PaywallScreen({ navigation, route }: any) {
     };
   }, []);
 
+  const goBackSmart = () => {
+    if (returnTo) {
+      navigation.navigate(returnTo);
+      return;
+    }
+    navigation.goBack();
+  };
+
   const onUnlock = async () => {
     Keyboard.dismiss();
     const c = normalizeCode(codeInput);
+
     if (!c) {
       Alert.alert("Fehlt noch", "Bitte Code eingeben.");
       return;
@@ -107,13 +111,19 @@ export function PaywallScreen({ navigation, route }: any) {
       await saveAppSettings({ isPro: true } as any);
       setIsPro(true);
       setCodeInput("");
-      Alert.alert("Pro aktiviert ✅", "Danke! Pro ist jetzt freigeschaltet.");
+
+      Alert.alert("Pro aktiviert ✅", "Danke! Pro ist jetzt freigeschaltet.", [
+        {
+          text: "Weiter",
+          onPress: goBackSmart,
+        },
+      ]);
+    } catch (e: any) {
+      Alert.alert("Fehler", String(e?.message ?? e));
     } finally {
       setBusy(false);
     }
   };
-
-  const goBack = () => navigation.goBack();
 
   const demoChipText = useMemo(() => {
     if (isPro) return "✅ Pro aktiv";
@@ -125,6 +135,9 @@ export function PaywallScreen({ navigation, route }: any) {
     return `Freischaltung erforderlich für: ${reason}`;
   }, [reason]);
 
+  const tintBorder = rgba(tokens.tint, 0.18);
+  const tintBg = rgba(tokens.tint, 0.06);
+
   return (
     <ThemedScreen section="home" style={{ paddingHorizontal: 0, paddingTop: 0 }}>
       <ScrollView contentContainerStyle={styles.scroll} showsVerticalScrollIndicator={false} keyboardShouldPersistTaps="handled">
@@ -134,7 +147,7 @@ export function PaywallScreen({ navigation, route }: any) {
             <Text style={styles.title}>VivaMed Pro</Text>
             <Text style={styles.subtitle}>{lockReasonLine}</Text>
           </View>
-          <VButton title="Zurück" variant="ghost" onPress={goBack} style={styles.headerGhost} />
+          <VButton title="Zurück" variant="ghost" onPress={goBackSmart} style={styles.headerGhost} />
         </View>
 
         {/* Hero */}
@@ -162,7 +175,7 @@ export function PaywallScreen({ navigation, route }: any) {
               <Text style={styles.item}>• Unbegrenzte Simulationen (prüfungsnah)</Text>
               <Text style={styles.item}>• Alle Drills + Wiederholungen</Text>
               <Text style={styles.item}>• KI-Coach Feedback (wenn Server aktiv)</Text>
-              <Text style={styles.item}>• Fortschritt & Streaks (Motivation)</Text>
+              <Text style={styles.item}>• Fortschritt & Streaks</Text>
             </View>
 
             {!isPro ? (
@@ -176,7 +189,7 @@ export function PaywallScreen({ navigation, route }: any) {
                   autoCorrect={false}
                   placeholder="VM-XXXX-XXXX"
                   placeholderTextColor={colors.textMuted}
-                  style={[styles.input, { borderColor: rgba(tokens.tint, 0.18), backgroundColor: rgba(tokens.tint, 0.06) }]}
+                  style={[styles.input, { borderColor: tintBorder, backgroundColor: tintBg }]}
                   returnKeyType="done"
                   onSubmitEditing={onUnlock}
                 />
@@ -195,7 +208,7 @@ export function PaywallScreen({ navigation, route }: any) {
               </View>
             ) : (
               <View style={{ marginTop: 14 }}>
-                <VButton title="Alles klar → Zurück" variant="cta" onPress={goBack} />
+                <VButton title="Alles klar → Zurück" variant="cta" onPress={goBackSmart} />
               </View>
             )}
           </Card>
