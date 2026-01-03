@@ -1,0 +1,98 @@
+import express from "express";
+
+const app = express();
+app.use(express.json({ limit: "2mb" }));
+
+app.get("/health", (_req, res) => res.json({ ok: true }));
+
+app.post("/api/examiner-turn", async (req, res) => {
+  try {
+    const { cfg, generatedCase, messages } = req.body ?? {};
+    if (!cfg || !Array.isArray(messages)) {
+      return res.status(400).json({ error: "Missing cfg or messages" });
+    }
+
+    const fachrichtung = String(cfg?.fachrichtung ?? "Innere Medizin");
+    const innereSubfach = String(cfg?.innereSubfach ?? "all");
+    const tone = String(cfg?.tone ?? "neutral");
+    const difficulty = Number(cfg?.difficulty ?? 65);
+    const examinerProfile = String(cfg?.examinerProfile ?? "standard");
+
+    const caseTitle = String(generatedCase?.title ?? "");
+    const vignette = String(generatedCase?.vignette ?? "");
+    const startQuestion = String(generatedCase?.startQuestion ?? "");
+    const checklist = generatedCase?.checklist ?? null;
+
+    const systemInstructions = `
+Du bist ein medizinischer mündlicher Prüfer.
+Du führst ein Prüfungsgespräch als Dialog und reagierst auf die letzte Antwort.
+
+Rahmen:
+- Fach: ${fachrichtung}
+- Innere-Unterfach: ${innereSubfach}
+- Ton: ${tone} (freundlich/neutral/streng)
+- Schwierigkeit: ${difficulty} (0..100)
+- Prüferprofil: ${examinerProfile}
+
+Regeln:
+- Stelle IMMER nur EINE Frage pro Turn (max 2 Sätze).
+- Keine langen Monologe, keine Tabellen.
+- Wenn Kandidat lückenhaft: hake nach (Red Flags), ohne zu spoilern.
+- Wenn Kandidat gut: gehe tiefer (DDx, Diagnostik, Therapie, Guidelines-Prinzipien).
+- Antworte als reiner Text.
+`.trim();
+
+    const caseContext = `
+FALLKONTEXT:
+Titel: ${caseTitle}
+Vignette: ${vignette}
+Startfrage: ${startQuestion}
+
+Checkliste (intern, nur Rahmen):
+${checkliststringify(checklist).slice(0, 6000) : "—"}
+`.trim();
+
+    const apiKey = process.env.OPENAI_API_KEY;
+    if (!apiKey) return res.status(500).json({ error: "Missing OPENAI_API_KEY env var" });
+
+    const inputMessages = [
+      { role: "system", content: systemInstructions },
+      { role: "system", content: caseContext },
+      ...messages.map((m) => ({
+        role: m.role === "examiner" ? "assistant" : "user",
+        content: String(m.text ?? ""),
+      })),
+    ];
+
+    const resp = await fetch("https://api.openai.com/v1/responses", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${apiKey}`,
+      },
+      body: JSON.stringify({
+        model: "gpt-5",
+        reasoning: { effort: "low" },
+        input: inputMessages,
+      }),
+    });
+
+    if (!resp.ok) {
+      const errText = await resp.text();
+      return res.status(500).json({ error: "OpenAI error", detail: errText });
+    }
+
+    const data = await resp.json();
+    const text =
+    data?.output?.[0]?.content?.find?.((c) => c?.type === "output_text")?.text ??
+      data?.output_text ??
+      "";
+
+    return res.json({ text: String(text).trim() });
+  } catch (e) {
+    return res.status(500).json({ error: "Server crashed", detail: String(e?.message ?? e) });
+  }
+});
+
+const port = process.env.PORT ? Number(process.env.PORT) : 8787;
+app.listen(port, () => console.log(`VivaMed server running on http://localhost:${port}`));
