@@ -1,24 +1,38 @@
 // server/index.js (ESM)
-// Start lokal:   OPENAI_API_KEY=... npm run dev
-// Render/Prod:   setzt PORT automatisch, OPENAI_API_KEY in Render Env setzen
+// Lokal:   OPENAI_API_KEY=... PORT=8791 npm run dev
+// Render:  setzt PORT automatisch, OPENAI_API_KEY + OPENAI_MODEL in Render Env setzen
 
 import express from "express";
 import cors from "cors";
 import { buildEscalationLine } from "./escalations.js";
-
+const BUILD_TAG = "health-v2-2026-01-03-2159";
 const app = express();
-
-// ✅ wichtig für Expo Go / iPhone
-app.use(cors());
-app.use(express.json({ limit: "2mb" }));
 
 const PORT = process.env.PORT ? Number(process.env.PORT) : 8787;
 const HOST = "0.0.0.0";
 
-// --- Root (damit die Render-URL ohne /health nicht "Error" zeigt) ---
-app.get("/", (_req, res) => {
-  res.redirect("/health");
+// ---- CORS (robust für Expo Go / iPhone + Preflight) ----
+app.use(
+  cors({
+    origin: true,
+    methods: ["GET", "POST", "OPTIONS"],
+    allowedHeaders: ["Content-Type", "Authorization"],
+  })
+);
+app.options("*", cors());
+
+// Body JSON
+app.use(express.json({ limit: "2mb" }));
+
+// ---- Mini Request Logger ----
+app.use((req, _res, next) => {
+  const t = new Date().toISOString();
+  console.log(`[${t}] ${req.method} ${req.path}`);
+  next();
 });
+
+// --- Root ---
+app.get("/", (_req, res) => res.redirect("/health"));
 
 // --- Health ---
 app.get("/health", (_req, res) => {
@@ -28,6 +42,9 @@ app.get("/health", (_req, res) => {
     port: PORT,
     time: new Date().toISOString(),
     env: process.env.RENDER ? "render" : "local",
+    build: BUILD_TAG,
+    hasOpenAIKey: Boolean(process.env.OPENAI_API_KEY),
+    model: process.env.OPENAI_MODEL || "gpt-5.2",
   });
 });
 
@@ -43,17 +60,15 @@ function difficultyTier(d) {
   return "low";
 }
 
-// --- Helpers: robust JSON extraction for feedback-report ---
+// --- Helpers: robust JSON extraction for feedback-report (Fallback) ---
 function extractJsonObject(text) {
   const s = String(text ?? "").trim();
   if (!s) return null;
 
-  // 1) Direct parse
   try {
     return JSON.parse(s);
   } catch {}
 
-  // 2) Try to extract first {...} block
   const first = s.indexOf("{");
   const last = s.lastIndexOf("}");
   if (first >= 0 && last > first) {
@@ -62,7 +77,6 @@ function extractJsonObject(text) {
       return JSON.parse(slice);
     } catch {}
   }
-
   return null;
 }
 
@@ -161,26 +175,142 @@ function miniFeedbackStyleForDifficulty(difficulty) {
   return { enabled: false, style: "kein Feedback" };
 }
 
-// Helper: OpenAI output_text extrahieren
-function extractOutputText(data) {
-  return (
-    data?.output?.[0]?.content?.find?.((c) => c?.type === "output_text")?.text ??
-    data?.output_text ??
-    ""
-  );
+// ---- Text-Sanitizing (keine Abkürzungen etc.) ----
+function sanitizeExaminerText(t) {
+  let s = String(t ?? "").trim();
+  if (!s) return "";
+
+  s = s.replace(/\bDDx\b/gi, "Differentialdiagnosen");
+  s = s.replace(/\bDx\b/gi, "Diagnose");
+  s = s.replace(/\bTx\b/gi, "Therapie");
+  s = s.replace(/\n{3,}/g, "\n\n").trim();
+
+  return s;
 }
 
-// ✅ neu: letzte Nutzerantwort
+// ---- Super-robuste Text-Extraktion (Responses API + Fallbacks) ----
+// Hintergrund: output[] kann Reasoning-/Tool-Items enthalten; output_text ist ein Helper, aber nicht immer da. :contentReference[oaicite:3]{index=3}
+function extractOutputText(data) {
+  if (typeof data?.output_text === "string" && data.output_text.trim()) {
+    return sanitizeExaminerText(data.output_text);
+  }
+
+  const texts = [];
+
+  const out = Array.isArray(data?.output) ? data.output : [];
+  for (const item of out) {
+    const content = Array.isArray(item?.content) ? item.content : [];
+
+    for (const c of content) {
+      if (c?.type === "output_text" && typeof c?.text === "string" && c.text.trim()) texts.push(c.text);
+      if (typeof c?.text === "string" && c.text.trim()) texts.push(c.text);
+      if (typeof c?.content === "string" && c.content.trim()) texts.push(c.content);
+    }
+
+    if (typeof item?.text === "string" && item.text.trim()) texts.push(item.text);
+  }
+
+  // Legacy-ish fallbacks
+  const maybeChat =
+    data?.choices?.[0]?.message?.content ||
+    data?.choices?.[0]?.text ||
+    data?.message?.content ||
+    data?.result?.content;
+  if (typeof maybeChat === "string" && maybeChat.trim()) texts.push(maybeChat);
+
+  // very defensive regex fallback
+  if (texts.length === 0) {
+    try {
+      const raw = JSON.stringify(data);
+      const m1 = raw.match(/"output_text"\s*:\s*"([^"]{2,8000})"/);
+      const m2 = raw.match(/"text"\s*:\s*"([^"]{2,8000})"/);
+      if (m1?.[1]) texts.push(m1[1]);
+      else if (m2?.[1]) texts.push(m2[1]);
+    } catch {}
+  }
+
+  return sanitizeExaminerText(texts.join("\n").trim());
+}
+
+// ✅ letzte Nutzerantwort
 function lastUserAnswer(openAiLikeMessages) {
   const last = [...openAiLikeMessages].reverse().find((m) => m.role === "user");
   return String(last?.content ?? "").trim();
 }
 
+// ---- Hint detection (Tipps / Hilfe) ----
+function isTipRequest(text) {
+  const s = String(text ?? "").toLowerCase();
+  return (
+    /\btipp\b/.test(s) ||
+    /hinweis/.test(s) ||
+    /help/.test(s) ||
+    /hilfe/.test(s) ||
+    (/kannst du mir/.test(s) && /tipp|hinweis|helfen/.test(s))
+  );
+}
+
 // ---- fetch (Node 20+ hat global fetch) ----
 const _fetch = globalThis.fetch;
 
-// --- Examiner turn ---
-app.post("/api/examiner-turn", async (req, res) => {
+// ---- OpenAI Request Helper mit Timeout ----
+async function openaiResponsesCall({ apiKey, body, reqId, timeoutMs = 30000 }) {
+  if (!_fetch) throw new Error("Missing global fetch in this Node runtime");
+
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+
+  try {
+    const resp = await _fetch("https://api.openai.com/v1/responses", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${apiKey}`,
+      },
+      body: JSON.stringify(body),
+      signal: controller.signal,
+    });
+
+    if (!resp.ok) {
+      const errText = await resp.text();
+      console.error(`[openai][${reqId}] OpenAI error ${resp.status}:`, errText?.slice?.(0, 2000));
+      const e = new Error(`OpenAI error ${resp.status}`);
+      e.status = resp.status;
+      e.detail = errText;
+      throw e;
+    }
+
+    return await resp.json();
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+// ---- Fallback, damit NIE leer zurückkommt (P0) :contentReference[oaicite:4]{index=4} ----
+function fallbackExaminerTurn({ userLast, phase, escalationLine, mfEnabled }) {
+  const quote = userLast ? `"${userLast.slice(0, 40).replace(/\n/g, " ")}${userLast.length > 40 ? "…" : ""}"` : `"—"`;
+
+  const q =
+    phase === "intro"
+      ? "Was ist Ihre führende Arbeitshypothese und welche Information fehlt Ihnen noch am meisten?"
+      : phase === "ddx"
+      ? "Nennen Sie die drei wichtigsten Differentialdiagnosen und sagen Sie kurz, was Sie jeweils erwarten würden."
+      : phase === "diagnostics"
+      ? "Was ist jetzt die nächste beste Diagnostik – und warum genau diese als nächster Schritt?"
+      : phase === "management"
+      ? "Was ist Ihr akuter Management-Plan in den nächsten 10 Minuten?"
+      : "Was ist Ihre Abschlussdiagnose, und welche zwei Punkte würden Sie der Patientin/dem Patienten jetzt erklären?";
+
+  const lines = [];
+  if (escalationLine) lines.push(`Verschärfung: ${escalationLine}`);
+  lines.push(`Bezug: ${quote}`);
+  lines.push(q);
+  if (mfEnabled) lines.push("Feedback: Strukturieren Sie kurz (Problem → Priorität → nächster Schritt).");
+  return lines.join("\n");
+}
+
+// ---- Handler: Examiner turn ----
+async function handleExaminerTurn(req, res) {
   try {
     const { cfg, generatedCase, messages } = req.body ?? {};
     if (!cfg || !Array.isArray(messages)) {
@@ -193,9 +323,7 @@ app.post("/api/examiner-turn", async (req, res) => {
     const difficulty = clamp(Number(cfg?.difficulty ?? 65), 0, 100);
     const examinerProfile = String(cfg?.examinerProfile ?? "standard");
 
-    // ✅ NEU: KI-Modus (Training vs Prüfung)
-    // Erwartete Werte: "training" | "exam"
-    // Fallback: bei niedriger Schwierigkeit eher training, sonst exam
+    // KI-Modus
     const aiModeRaw = String(cfg?.aiMode ?? "").trim().toLowerCase();
     const aiMode =
       aiModeRaw === "training" || aiModeRaw === "exam"
@@ -218,18 +346,9 @@ app.post("/api/examiner-turn", async (req, res) => {
 
     const phase = inferPhaseFromTurns(asOpenAiLike);
 
-    const escalate = shouldEscalate({
-      difficulty,
-      messages: asOpenAiLike,
-    });
-
+    const escalate = shouldEscalate({ difficulty, messages: asOpenAiLike });
     const escalationLine = escalate
-      ? buildEscalationLine({
-          fachrichtung,
-          phase,
-          vignette,
-          title: caseTitle,
-        })
+      ? buildEscalationLine({ fachrichtung, phase, vignette, title: caseTitle })
       : null;
 
     const mf = miniFeedbackStyleForDifficulty(difficulty);
@@ -266,26 +385,41 @@ app.post("/api/examiner-turn", async (req, res) => {
         : "Einsteigerfreundlich: stark strukturierend, kleine Hilfen erlaubt.";
 
     const userLast = lastUserAnswer(asOpenAiLike);
+    const userAskedTip = isTipRequest(userLast);
 
-    // ✅ NEU: Modus-Definitionen
+    const tipPolicy =
+      userAskedTip
+        ? `
+TIPP-REGEL (sehr wichtig):
+- Der Kandidat hat um einen Tipp gebeten.
+- Antworte neutral-professionell und gib GENAU EINEN kleinen Tipp/Hinweis.
+- Kein Spoiler (keine fertige Diagnose).
+- Danach stelle wieder GENAU EINE Frage, passend zum Fall.
+`.trim()
+        : `
+TIPP-REGEL:
+- Wenn der Kandidat NICHT um einen Tipp bittet, gib keine extra Tipps.
+`.trim();
+
     const modeLine =
       aiMode === "exam"
         ? `
 Modus: PRÜFUNGSSIMULATION.
-- Du bist knapp, fordernd, M3-nah.
-- Du hilfst kaum. Wenn etwas unscharf ist: du fragst nach, statt zu erklären.
-- Du darfst bei difficulty>=70 auch unterbrechen, um Präzision/Prioritäten einzufordern.
+- Knapp, fordernd, M3-nah.
+- Du prüfst v.a. Prioritäten, Red Flags, Begründung.
+- Bei difficulty>=70 darfst du unterbrechen, um Präzision/Prioritäten einzufordern.
+(Hinweis: Tipp-Regel hat Vorrang, falls der Kandidat um einen Tipp bittet.)
 `.trim()
         : `
 Modus: TRAINING.
-- Du bist menschlich, zugewandt, aber prüfungsnah.
-- Wenn etwas unscharf ist: du fragst 1x nach UND darfst max. 1 Mini-Hinweis geben.
-- Du erklärst NICHT lang, sondern führst mit gezielten Nachfragen.
+- Zugewandt, menschlich, aber prüfungsnah.
+- Bei Unschärfe: 1x nachfragen + max 1 Mini-Hinweis (ohne Spoiler).
+- Keine langen Erklärungen: führe mit gezielten Fragen.
 `.trim();
 
     const systemInstructions = `
 Du bist ein echter medizinischer Prüfer (M3/OSCE), deutsch, realistisch, menschlich.
-Du führst ein Prüfungsgespräch als Dialog. Du reagierst PRÄZISE auf die letzte Antwort des Kandidaten.
+Du führst eine mündliche Prüfung als Dialog. Du reagierst präzise auf die letzte Antwort.
 
 ${modeLine}
 
@@ -298,46 +432,30 @@ Rahmen:
 - Prüferverhalten (dynamisch): ${personaStyle}
 - Aktuelle Phase (intern): ${phase}
 
-Wichtig: Gesprächsqualität
-1) Bezug:
-- Beziehe dich IMMER auf 1–2 konkrete Elemente aus der letzten Antwort.
-- Zitiere kurz 1–6 Wörter in Anführungszeichen, z.B. "Troponin" oder "NIV".
-- Wenn die Antwort sehr allgemein ist: sag das knapp ("Das ist mir zu unkonkret.").
+WICHTIG (Sprache):
+- Keine Abkürzungen: nicht "DDx/Dx/Tx". Schreibe aus.
+- Kurze Sätze. Keine Textwand. Keine Tabellen. Keine Bullet-Listen.
 
-2) Wenn unklar/unscharf:
-- Stelle eine KLÄRUNGSFRAGE statt Themawechsel.
-- Beispiele: "Was meinen Sie genau mit …?" / "Welche 2 Ursachen priorisieren Sie – und warum?"
+Prüferlogik:
+1) Bezugspflicht: beziehe dich immer auf 1–2 konkrete Elemente. Zitat 1–6 Wörter in Anführungszeichen.
+2) Hartnäckigkeit: bleib 1–2 Turns an Unklarheiten.
+3) Unterbrechen (nur difficulty>=70): "Unterbrechung:" + 1 Satz Korrektur + dann 1 präzise Frage.
 
-3) Prüferlogik (prüfungsnah):
-- Wenn gut: geh 1 Stufe tiefer (Begründung, Priorisierung, Konsequenz).
-- Wenn lückenhaft: fokussiere auf die größte Lücke (Red Flags / nächster Schritt).
-- Wenn Kandidat festhängt:
-  - Im TRAINING-Modus: max. 1 Mini-Hinweis.
-  - Im PRÜFUNG-Modus: KEIN Hinweis, nur Nachfragen.
-
-4) Unterbrechen/Pushen (nur bei difficulty >= 70):
-- Wenn Antwort lang aber unspezifisch ist: beginne mit "Unterbrechung:" + 1 Satz Korrektur + dann 1 präzise Frage.
-- Wenn Kandidat abdriftet: lenke zurück auf Prioritäten.
+${tipPolicy}
 
 Fallverschärfung:
-- Für diesen Turn: escalate=${escalate ? "true" : "false"}.
-- Wenn escalate=true: Nutze GENAU die vorgegebene Verschärfungs-Zeile (kein Erfinden zusätzlicher Befunde).
+- escalate=${escalate ? "true" : "false"}
+- Wenn escalate=true: nutze GENAU die vorgegebene Verschärfung.
 
-Ausgabeformat (sehr wichtig):
-- Schreibe wie ein Mensch (kurze Sätze, natürliche Sprache, keine Textwand).
-- Maximal 4 kurze Zeilen insgesamt.
-- Struktur:
-  Zeile 1: optional "Verschärfung: ..." ODER optional "Unterbrechung: ..."
-  Zeile 2: 1 sehr kurzer Bezug auf die letzte Antwort (z.B. "Sie sagen '...'.")
-  Zeile 3: GENAU 1 Frage (max. 1–2 Sätze)
-  Zeile 4: optional "Feedback: ..." nur wenn miniFeedbackEnabled=true
+Ausgabeformat:
+- Max 4 kurze Zeilen.
+- Zeile 1: optional "Verschärfung:" oder "Unterbrechung:"
+- Zeile 2: 1 kurzer Bezug mit Zitat
+- Zeile 3: GENAU 1 Frage
+- Zeile 4: optional "Feedback:" nur wenn miniFeedbackEnabled=true
+- Pro Turn genau 1 Frage. Reiner Text.
 
-- PRO TURN genau 1 Frage.
-- Keine Tabellen, keine Bullet-Listen.
-- Keine Meta-Erklärungen ("Ich bin ein Prüfer...").
-- Antworte als reiner Text.
-
-Letzte Kandidatenantwort (nur zur Orientierung, nicht wiederholen, nur kurz referenzieren):
+Letzte Kandidatenantwort:
 "${userLast}"
 `.trim();
 
@@ -346,15 +464,13 @@ FALLKONTEXT:
 Titel: ${caseTitle}
 Vignette: ${vignette}
 Startfrage: ${startQuestion}
-
 Checkliste (intern, nur Rahmen):
 ${checklist ? JSON.stringify(checklist).slice(0, 6000) : "—"}
 `.trim();
 
     const miniFeedbackHint = mf.enabled
-      ? `miniFeedbackEnabled=true → Gib am Ende genau EINE Zeile "Feedback: ..." (max 1 Satz).
+      ? `miniFeedbackEnabled=true → Am Ende GENAU EINE Zeile "Feedback: ..." (max 1 Satz).
 Stil: ${mf.style}
-Inhalt: Mischung aus (a) fachlich (Priorisierung/Red Flags/next step) und (b) formal (Struktur, Klarheit, Priorisierung, Vortragsweise).
 Wichtig: nicht spoilern, keine langen Erklärungen.`
       : "miniFeedbackEnabled=false → KEINE 'Feedback:' Zeile ausgeben.";
 
@@ -363,59 +479,109 @@ Wichtig: nicht spoilern, keine langen Erklärungen.`
       : "Keine Verschärfung in diesem Turn.";
 
     const apiKey = process.env.OPENAI_API_KEY;
-    if (!apiKey) {
-      return res.status(500).json({ error: "Missing OPENAI_API_KEY env var" });
-    }
+    if (!apiKey) return res.status(500).json({ error: "Missing OPENAI_API_KEY env var" });
 
-    if (!_fetch) {
-      return res.status(500).json({ error: "Missing global fetch in this Node runtime" });
-    }
+    const model = process.env.OPENAI_MODEL || "gpt-5.2"; // gpt-5 ist „previous“, 5.2 ist aktuell empfohlen :contentReference[oaicite:5]{index=5}
 
     const reqId = Math.random().toString(16).slice(2);
     const t0 = Date.now();
 
-    const resp = await _fetch("https://api.openai.com/v1/responses", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${apiKey}`,
-      },
-      body: JSON.stringify({
-        model: "gpt-5",
-        reasoning: { effort: "low" },
+    const body = {
+      model,
+      reasoning: { effort: "low" },
+      input: [
+        { role: "system", content: systemInstructions },
+        { role: "system", content: caseContext },
+        { role: "system", content: escalationHint },
+        { role: "system", content: miniFeedbackHint },
+        ...asOpenAiLike,
+      ],
+    };
+
+    let data = await openaiResponsesCall({ apiKey, reqId, timeoutMs: 45000, body });
+    let text = extractOutputText(data);
+
+    // Retry 1x (falls leer)
+    if (!text) {
+      console.warn(`[examiner-turn][${reqId}] EMPTY TEXT → retry once`);
+      const retryBody = {
+        ...body,
         input: [
-          { role: "system", content: systemInstructions },
+          {
+            role: "system",
+            content:
+              systemInstructions +
+              "\n\nWICHTIG: Gib JETZT unbedingt eine Text-Antwort aus (mindestens 1 Zeile). Kein leerer Output.",
+          },
           { role: "system", content: caseContext },
           { role: "system", content: escalationHint },
           { role: "system", content: miniFeedbackHint },
           ...asOpenAiLike,
         ],
-      }),
-    });
-
-    if (!resp.ok) {
-      const errText = await resp.text();
-      console.error(`[examiner-turn][${reqId}] OpenAI error ${resp.status}:`, errText?.slice?.(0, 2000));
-      return res.status(500).json({ error: "OpenAI error", status: resp.status, detail: errText });
+      };
+      data = await openaiResponsesCall({ apiKey, reqId: `${reqId}-r`, timeoutMs: 45000, body: retryBody });
+      text = extractOutputText(data);
     }
 
-    const data = await resp.json();
-    const text = extractOutputText(data);
     const dt = Date.now() - t0;
 
+    // ✅ P0: NIE leer zurückgeben → Fallback statt 502 :contentReference[oaicite:6]{index=6}
+    if (!text) {
+      console.error(
+        `[examiner-turn][${reqId}] STILL EMPTY after retry. Raw response (truncated):`,
+        JSON.stringify(data).slice(0, 4000)
+      );
+
+      const fallback = fallbackExaminerTurn({
+        userLast,
+        phase,
+        escalationLine,
+        mfEnabled: mf.enabled,
+      });
+
+      return res.json({
+        text: fallback,
+        meta: { mode: aiMode, phase, persona, tipAsked: Boolean(userAskedTip), fallbackUsed: true },
+      });
+    }
+
     console.log(
-      `[examiner-turn][${reqId}] ok in ${dt}ms (mode=${aiMode}, difficulty=${difficulty}, persona=${persona}, phase=${phase})`
+      `[examiner-turn][${reqId}] ok in ${dt}ms (model=${model}, mode=${aiMode}, difficulty=${difficulty}, persona=${persona}, phase=${phase}, tipAsked=${userAskedTip})`
     );
 
-    return res.json({ text: String(text).trim(), meta: { mode: aiMode, phase, persona } });
+    return res.json({
+      text: String(text).trim(),
+      meta: { mode: aiMode, phase, persona, tipAsked: Boolean(userAskedTip), fallbackUsed: false },
+    });
   } catch (e) {
-    console.error("[examiner-turn] Server crashed:", e);
-    return res.status(500).json({ error: "Server crashed", detail: String(e?.message ?? e) });
-  }
-});
+    const status = Number(e?.status ?? 500);
+    const detail = e?.detail ?? String(e?.message ?? e);
+    console.error("[examiner-turn] error:", e);
 
-// --- Feedback report ---
-app.post("/api/feedback-report", async (req, res) => {
+    // ✅ Auch hier: lieber „weicher“ als App kaputt
+    if (status >= 500) {
+      return res.status(200).json({
+        text:
+          'Bezug: "—"\nIch habe gerade ein technisches Problem. Was wäre Ihr nächster klinischer Schritt (Priorität) – und warum?',
+        meta: { fallbackUsed: true, error: true },
+      });
+    }
+
+    return res.status(status >= 400 && status < 600 ? status : 500).json({
+      error: "examiner-turn failed",
+      detail: String(detail).slice(0, 4000),
+    });
+  }
+}
+
+// --- Primary route + Aliases ---
+app.post("/api/examiner-turn", handleExaminerTurn);
+app.post("/api/examinerTurn", handleExaminerTurn);
+app.post("/api/chat", handleExaminerTurn);
+app.post("/api/simulate", handleExaminerTurn);
+
+// --- Feedback report (Structured Outputs) ---
+async function handleFeedbackReport(req, res) {
   try {
     const { cfg, generatedCase, messages } = req.body ?? {};
     if (!cfg || !Array.isArray(messages)) {
@@ -434,13 +600,9 @@ app.post("/api/feedback-report", async (req, res) => {
     const checklist = generatedCase?.checklist ?? null;
 
     const apiKey = process.env.OPENAI_API_KEY;
-    if (!apiKey) {
-      return res.status(500).json({ error: "Missing OPENAI_API_KEY env var" });
-    }
+    if (!apiKey) return res.status(500).json({ error: "Missing OPENAI_API_KEY env var" });
 
-    if (!_fetch) {
-      return res.status(500).json({ error: "Missing global fetch in this Node runtime" });
-    }
+    const model = process.env.OPENAI_MODEL || "gpt-5.2";
 
     const convo = messages
       .filter((m) => m && (m.role === "user" || m.role === "examiner"))
@@ -473,41 +635,8 @@ Rahmen:
 
 Regeln:
 - Beziehe dich NUR auf Inhalte, die in der Konversation wirklich vorkamen.
-- Wenn etwas nicht gesagt wurde: dann als Lücke benennen, aber nicht so tun, als wäre es gesagt worden.
-- Fallkontext/Checkliste sind nur Hintergrund (nicht wörtlich zitieren).
+- Wenn etwas nicht gesagt wurde: als Lücke benennen, nicht erfinden.
 - Keine Tabellen.
-- Output MUSS valides JSON sein, ohne Backticks, ohne zusätzlichen Text.
-`.trim();
-
-    const schema = `
-Schema exakt (valide JSON):
-
-{
-  "overall": { "score": 0, "one_liner": "..." },
-  "medical": {
-    "likely_dx": ["..."],
-    "dangerous_ddx_missing": ["..."],
-    "diagnostics_next_best": ["..."],
-    "management_next_best": ["..."],
-    "red_flags": ["..."]
-  },
-  "communication": {
-    "structure": { "score": 0, "note": "..." },
-    "prioritization": { "score": 0, "note": "..." },
-    "clarity": { "score": 0, "note": "..." },
-    "empathy": { "score": 0, "note": "..." }
-  },
-  "top3_strengths": ["...","...","..."],
-  "top3_improvements": ["...","...","..."],
-  "next_time_script": {
-    "opening": "1-2 Sätze",
-    "ddx": "1-2 Sätze",
-    "diagnostics": "1-2 Sätze",
-    "management": "1-2 Sätze",
-    "closing": "1-2 Sätze"
-  },
-  "drills": [{ "title": "...", "why": "...", "how": "..." }]
-}
 `.trim();
 
     const caseContext = `
@@ -519,50 +648,178 @@ Checkliste (intern, nur Rahmen):
 ${checklist ? JSON.stringify(checklist).slice(0, 6000) : "—"}
 `.trim();
 
+    // Structured Outputs: JSON Schema statt „bitte JSON“ (viel stabiler) :contentReference[oaicite:7]{index=7}
+    const feedbackSchema = {
+      type: "object",
+      additionalProperties: false,
+      properties: {
+        overall: {
+          type: "object",
+          additionalProperties: false,
+          properties: {
+            score: { type: "number" },
+            one_liner: { type: "string" },
+          },
+          required: ["score", "one_liner"],
+        },
+        medical: {
+          type: "object",
+          additionalProperties: false,
+          properties: {
+            likely_dx: { type: "array", items: { type: "string" } },
+            dangerous_ddx_missing: { type: "array", items: { type: "string" } },
+            diagnostics_next_best: { type: "array", items: { type: "string" } },
+            management_next_best: { type: "array", items: { type: "string" } },
+            red_flags: { type: "array", items: { type: "string" } },
+          },
+          required: [
+            "likely_dx",
+            "dangerous_ddx_missing",
+            "diagnostics_next_best",
+            "management_next_best",
+            "red_flags",
+          ],
+        },
+        communication: {
+          type: "object",
+          additionalProperties: false,
+          properties: {
+            structure: {
+              type: "object",
+              additionalProperties: false,
+              properties: { score: { type: "number" }, note: { type: "string" } },
+              required: ["score", "note"],
+            },
+            prioritization: {
+              type: "object",
+              additionalProperties: false,
+              properties: { score: { type: "number" }, note: { type: "string" } },
+              required: ["score", "note"],
+            },
+            clarity: {
+              type: "object",
+              additionalProperties: false,
+              properties: { score: { type: "number" }, note: { type: "string" } },
+              required: ["score", "note"],
+            },
+            empathy: {
+              type: "object",
+              additionalProperties: false,
+              properties: { score: { type: "number" }, note: { type: "string" } },
+              required: ["score", "note"],
+            },
+          },
+          required: ["structure", "prioritization", "clarity", "empathy"],
+        },
+        top3_strengths: { type: "array", items: { type: "string" }, minItems: 3, maxItems: 3 },
+        top3_improvements: { type: "array", items: { type: "string" }, minItems: 3, maxItems: 3 },
+        next_time_script: {
+          type: "object",
+          additionalProperties: false,
+          properties: {
+            opening: { type: "string" },
+            ddx: { type: "string" },
+            diagnostics: { type: "string" },
+            management: { type: "string" },
+            closing: { type: "string" },
+          },
+          required: ["opening", "ddx", "diagnostics", "management", "closing"],
+        },
+        drills: {
+          type: "array",
+          items: {
+            type: "object",
+            additionalProperties: false,
+            properties: {
+              title: { type: "string" },
+              why: { type: "string" },
+              how: { type: "string" },
+            },
+            required: ["title", "why", "how"],
+          },
+        },
+      },
+      required: [
+        "overall",
+        "medical",
+        "communication",
+        "top3_strengths",
+        "top3_improvements",
+        "next_time_script",
+        "drills",
+      ],
+    };
+
     const reqId = Math.random().toString(16).slice(2);
 
-    const resp = await _fetch("https://api.openai.com/v1/responses", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${apiKey}`,
-      },
-      body: JSON.stringify({
-        model: "gpt-5",
+    const data = await openaiResponsesCall({
+      apiKey,
+      reqId,
+      timeoutMs: 60000,
+      body: {
+        model,
         reasoning: { effort: "low" },
         input: [
           { role: "system", content: system },
-          { role: "system", content: schema },
           { role: "system", content: caseContext },
           ...convo,
         ],
-      }),
+        text: {
+          format: {
+            type: "json_schema",
+            strict: true,
+            name: "vivamed_feedback_report",
+            schema: feedbackSchema,
+          },
+        },
+      },
     });
 
-    if (!resp.ok) {
-      const errText = await resp.text();
-      console.error(`[feedback-report][${reqId}] OpenAI error ${resp.status}:`, errText?.slice?.(0, 2000));
-      return res.status(500).json({ error: "OpenAI error", status: resp.status, detail: errText });
-    }
-
-    const data = await resp.json();
+    // Bei Structured Outputs ist output_text oft JSON-String; wir parsen sicherheitshalber:
     const text = extractOutputText(data);
+    const parsed = extractJsonObject(text) ?? data?.output_parsed ?? null;
 
-    const parsed = extractJsonObject(text);
     if (!parsed) {
-      console.error(`[feedback-report][${reqId}] AI returned non-JSON:`, String(text).slice(0, 500));
+      console.error(`[feedback-report][${reqId}] Could not parse structured output. Text:`, String(text).slice(0, 500));
       return res.status(500).json({ error: "AI returned non-JSON", detail: String(text).slice(0, 2000) });
     }
 
     return res.json({ report: parsed });
   } catch (e) {
-    console.error("[feedback-report] Server crashed:", e);
-    return res.status(500).json({ error: "Server crashed", detail: String(e?.message ?? e) });
+    const status = Number(e?.status ?? 500);
+    const detail = e?.detail ?? String(e?.message ?? e);
+    console.error("[feedback-report] error:", e);
+    return res.status(status >= 400 && status < 600 ? status : 500).json({
+      error: "feedback-report failed",
+      detail: String(detail).slice(0, 4000),
+    });
   }
+}
+
+app.post("/api/feedback-report", handleFeedbackReport);
+app.post("/api/feedbackReport", handleFeedbackReport);
+
+// ---- 404 Handler ----
+app.use((req, res) => {
+  return res.status(404).json({
+    error: "Not found",
+    method: req.method,
+    path: req.path,
+    hint: "Try /health and /api/examiner-turn.",
+  });
 });
 
-// ✅ Listen on 0.0.0.0 (Render + LAN)
+// ---- Global Error Handler ----
+app.use((err, _req, res, _next) => {
+  console.error("[express] unhandled error:", err);
+  res.status(500).json({ error: "Server crashed", detail: String(err?.message ?? err) });
+});
+
+// ✅ Listen
 app.listen(PORT, HOST, () => {
   console.log(`VivaMed server running on http://${HOST}:${PORT}`);
   console.log(`Health check: http://localhost:${PORT}/health`);
+  if (!process.env.OPENAI_API_KEY) {
+    console.log("⚠️  OPENAI_API_KEY is NOT set. /api/* calls will fail until you set it.");
+  }
 });
