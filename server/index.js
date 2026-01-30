@@ -431,12 +431,14 @@ async function googleRecognizeV2({ fileBuffer, languageCode = "de-DE", reqId }) 
   const request = {
     recognizer,
     config: {
-      autoDecodingConfig: {}, // key for handling m4a/etc without explicit encoding
+      autoDecodingConfig: {}, // erkennt m4a/mp3 etc
       languageCodes: [String(languageCode || "de-DE")],
       model: "latest_long",
     },
-    content: audioBytes,
-  };
+    audio: {
+      content: audioBytes,
+    },
+  };  
 
   const t0 = Date.now();
   const [resp] = await client.recognize(request);
