@@ -685,11 +685,18 @@ async function handleStt(req, res) {
       });
     }
 
-    const out = await googleRecognizeV2({
-      fileBuffer: file.buffer,
-      languageCode: lang,
-      reqId,
-    });
+    const request = {
+      recognizer,
+      config: {
+        autoDecodingConfig: {},
+        languageCodes: [String(languageCode || "de-DE")],
+        model: "latest_long",
+      },
+      audio: {
+        content: audioBytes, // ⚠️ muss exakt so heißen
+      },
+    };
+    
 
     return res.json(out);
   } catch (e) {
