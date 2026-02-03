@@ -1,30 +1,50 @@
 {
   "expo": {
-    "name": "VivaMed",
+    "name": "ExamEcho",
     "slug": "VivaMed",
-    "version": "1.0.0",
+    "scheme": "examecho",
+    "version": "1.0.1",
     "orientation": "portrait",
-    "icon": "./assets/icon.png",
+    "icon": "./assets/branding/app-icon-examecho.png",
     "userInterfaceStyle": "light",
-    "newArchEnabled": true,
     "splash": {
       "image": "./assets/splash-icon.png",
       "resizeMode": "contain",
       "backgroundColor": "#ffffff"
     },
     "ios": {
-      "supportsTablet": true
+      "bundleIdentifier": "com.juliakerkhoff.vivamed",
+      "buildNumber": "13",
+      "supportsTablet": true,
+      "infoPlist": {
+        "CFBundleDisplayName": "ExamEcho",
+        "CFBundleName": "ExamEcho",
+        "ITSAppUsesNonExemptEncryption": false,
+        "NSCameraUsageDescription": "ExamEcho benötigt optional Zugriff auf die Kamera, z. B. für das Erfassen von Lerninhalten. Die Kamera wird nur mit deiner Zustimmung verwendet.",
+        "NSMicrophoneUsageDescription": "ExamEcho nutzt das Mikrofon optional für mündliches Üben und Sprachfunktionen.",
+        "NSSpeechRecognitionUsageDescription": "ExamEcho verwendet Spracherkennung, um gesprochene Antworten in Text umzuwandeln.",
+        "NSPhotoLibraryUsageDescription": "ExamEcho benötigt optional Zugriff auf deine Fotos, z. B. um Lerninhalte auszuwählen.",
+        "NSPhotoLibraryAddUsageDescription": "ExamEcho kann optional Inhalte in deiner Fotomediathek speichern.",
+        "NSFaceIDUsageDescription": "Face ID kann optional zur sicheren Anmeldung genutzt werden."
+      }
     },
     "android": {
+      "package": "com.juliakerkhoff.vivamed",
+      "versionCode": 13,
       "adaptiveIcon": {
-        "foregroundImage": "./assets/adaptive-icon.png",
+        "foregroundImage": "./assets/branding/app-icon-examecho.png",
         "backgroundColor": "#ffffff"
-      },
-      "edgeToEdgeEnabled": true,
-      "predictiveBackGestureEnabled": false
+      }
     },
     "web": {
       "favicon": "./assets/favicon.png"
-    }
+    },
+    "extra": {
+      "eas": {
+        "projectId": "8928cb62-1dd3-4586-bdcd-407b21117537"
+      }
+    },
+    "owner": "juliakerkhoff",
+    "plugins": ["@react-native-community/datetimepicker"]
   }
 }
